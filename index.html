@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Expense Renamer">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#0b5cad">
+<title>Expense Renamer</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root{--bg:#f2f4f7;--card:#fff;--text:#1b1f24;--muted:#667085;--brand:#0b5cad;--ok:#12805c;--warn:#b54708;--err:#b42318;--line:#d0d5dd}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1a1d23;--text:#eef0f3;--muted:#98a2b3;--line:#344054}}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px)}
+  h1{font-size:24px;margin:18px 0 4px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 16px}
+  .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+  .btn{display:flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:14px;padding:16px 10px;font-size:17px;font-weight:600;background:var(--brand);color:#fff;cursor:pointer;text-align:center}
+  .btn.secondary{background:var(--card);color:var(--brand);border:1.5px solid var(--brand)}
+  .btn.ok{background:var(--ok)}
+  .btn:disabled{opacity:.5}
+  .btn.full{width:100%;margin-bottom:12px}
+  input[type=file]{display:none}
+  .card{background:var(--card);border-radius:16px;padding:14px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .head{display:flex;gap:12px;align-items:center;margin-bottom:10px}
+  .thumb{width:56px;height:56px;border-radius:10px;object-fit:cover;background:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--err);font-size:13px;flex-shrink:0}
+  .orig{font-size:13px;color:var(--muted);word-break:break-all}
+  .status{font-size:14px;font-weight:600}
+  .status.ok{color:var(--ok)}.status.warn{color:var(--warn)}.status.err{color:var(--err)}
+  label{display:block;font-size:13px;color:var(--muted);margin:8px 0 4px}
+  input.f{width:100%;font-size:17px;padding:11px;border-radius:10px;border:1.5px solid var(--line);background:var(--bg);color:var(--text);-webkit-appearance:none}
+  input.f.missing{border-color:var(--warn)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .name{margin:12px 0;padding:10px;border-radius:10px;background:var(--bg);font-family:ui-monospace,Menlo,monospace;font-size:14px;word-break:break-all}
+  .cardbtns{display:grid;grid-template-columns:2fr 1fr;gap:8px}
+  .cardbtns .btn{padding:12px;font-size:16px}
+  details{margin-top:8px;font-size:13px;color:var(--muted)}
+  pre{white-space:pre-wrap;max-height:200px;overflow:auto;font-size:12px}
+  .empty{text-align:center;color:var(--muted);padding:30px 10px;font-size:15px}
+  .bar{height:4px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:6px}
+  .bar>div{height:100%;width:0;background:var(--brand);transition:width .2s}
+</style>
+</head>
+<body>
+<h1>Expense Renamer</h1>
+<p class="sub">Renames receipts as <b>YYYY-MM-DD Company Amount</b>. Everything is processed on this phone.</p>
+
+<div class="actions">
+  <label class="btn" for="cam">📷 Take Photo</label>
+  <label class="btn secondary" for="pick">📄 Choose Files</label>
+</div>
+<input id="cam" type="file" accept="image/*" capture="environment">
+<input id="pick" type="file" accept="application/pdf,image/*,.pdf,.heic,.jpg,.jpeg,.png" multiple>
+
+<button id="saveAll" class="btn ok full" style="display:none">💾 Save All</button>
+<div id="list"><div class="empty">Take a photo of a receipt or choose a PDF or image to get started.</div></div>
+
+<script>
+"use strict";
+if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const items = [];
+let worker = null, ocrItem = null;
+const $ = s => document.querySelector(s);
+
+/* ---------- OCR engine (runs on the phone) ---------- */
+async function getWorker(){
+  if (worker) return worker;
+  if (!window.Tesseract) throw new Error("The text-reading engine could not load. Check your internet connection and reload the page.");
+  worker = await Tesseract.createWorker("eng", 1, {
+    logger: m => { if (ocrItem && m.status === "recognizing text") setProgress(ocrItem, m.progress); }
+  });
+  return worker;
+}
+
+async function loadImage(file){
+  try { return await createImageBitmap(file); }
+  catch(e){
+    return await new Promise((res, rej) => {
+      const img = new Image(); const url = URL.createObjectURL(file);
+      img.onload = () => res(img);
+      img.onerror = () => rej(new Error("This image could not be opened. Try a JPG or PNG."));
+      img.src = url;
+    });
+  }
+}
+
+function toCanvas(src, max = 2200){
+  const w = src.width, h = src.height, s = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement("canvas");
+  c.width = Math.round(w * s); c.height = Math.round(h * s);
+  const ctx = c.getContext("2d");
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  // Greyscale + contrast stretch to help OCR
+  const d = ctx.getImageData(0, 0, c.width, c.height), p = d.data;
+  let lo = 255, hi = 0;
+  for (let i = 0; i < p.length; i += 4){ const g = (p[i]*.299 + p[i+1]*.587 + p[i+2]*.114)|0; p[i] = g; if (g < lo) lo = g; if (g > hi) hi = g; }
+  const r = Math.max(1, hi - lo);
+  for (let i = 0; i < p.length; i += 4){ const g = Math.min(255, Math.max(0, ((p[i] - lo) * 255 / r)|0)); p[i] = p[i+1] = p[i+2] = g; }
+  ctx.putImageData(d, 0, 0);
+  return c;
+}
+
+async function ocr(item, canvas){
+  const w = await getWorker();
+  ocrItem = item;
+  const { data } = await w.recognize(canvas);
+  ocrItem = null;
+  return data.text || "";
+}
+
+async function readPdf(item){
+  if (!window.pdfjsLib) throw new Error("The PDF reader could not load. Check your internet connection and reload the page.");
+  let pdf;
+  try { pdf = await pdfjsLib.getDocument({ data: await item.file.arrayBuffer() }).promise; }
+  catch(e){
+    if (e && e.name === "PasswordException") throw new Error("This PDF is password protected and can't be read. Enter the details manually.");
+    throw new Error("This PDF appears to be damaged or unreadable.");
+  }
+  let text = "";
+  const pages = Math.min(pdf.numPages, 3);
+  for (let n = 1; n <= pages; n++){
+    const page = await pdf.getPage(n);
+    const tc = await page.getTextContent();
+    let lastY = null, line = "";
+    for (const it of tc.items){
+      const y = it.transform ? Math.round(it.transform[5]) : null;
+      if (lastY !== null && y !== null && Math.abs(y - lastY) > 3){ text += line.trim() + "\n"; line = ""; }
+      line += it.str + " "; lastY = y;
+    }
+    text += line.trim() + "\n";
+  }
+  if (text.replace(/\s/g, "").length >= 25) return text;
+  // Scanned PDF: no text layer, so render page 1 and run OCR
+  setStatus(item, "Scanned PDF – reading image…", "");
+  const page = await pdf.getPage(1);
+  const vp = page.getViewport({ scale: 2.5 });
+  const c = document.createElement("canvas"); c.width = vp.width; c.height = vp.height;
+  await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+  return await ocr(item, toCanvas(c));
+}
+
+/* ---------- Extraction rules ---------- */
+const MONTHS = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+const pad = n => String(n).padStart(2, "0");
+
+function validDate(y, m, d){
+  if (y < 100) y += 2000;
+  const now = new Date().getFullYear();
+  if (y < 2000 || y > now + 1 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(y, m - 1, d);
+  if (dt.getMonth() !== m - 1) return null;
+  return `${y}-${pad(m)}-${pad(d)}`;
+}
+
+function findDate(text){
+  const lines = text.split("\n"), cands = [];
+  const mon = "(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?";
+  lines.forEach((ln, idx) => {
+    const found = [];
+    let m;
+    const r1 = /\b(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})\b/g;
+    while ((m = r1.exec(ln))) found.push(validDate(+m[1], +m[2], +m[3]));
+    const r2 = /\b(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4}|\d{2})\b/g; // Australian dd/mm/yyyy
+    while ((m = r2.exec(ln))) found.push(validDate(+m[3], +m[2], +m[1]));
+    const r3 = new RegExp("\\b(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-]+" + mon + "[\\s,\\-]+(\\d{4}|\\d{2})\\b", "gi");
+    while ((m = r3.exec(ln))) found.push(validDate(+m[3], MONTHS[m[2].toLowerCase().slice(0,3)], +m[1]));
+    const r4 = new RegExp("\\b" + mon + "\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})\\b", "gi");
+    while ((m = r4.exec(ln))) found.push(validDate(+m[3], MONTHS[m[1].toLowerCase().slice(0,3)], +m[2]));
+    const near = (ln + " " + (lines[idx-1] || "")).toLowerCase();
+    let score = 0;
+    if (/(tax invoice date|invoice date|date of issue|issue date|issued)/.test(near)) score += 4;
+    else if (/(receipt date|transaction date|purchase date|date)/.test(near)) score += 2;
+    if (/(due|expir|valid|period|from|until|check.?out|departure|arrival)/.test(near)) score -= 3;
+    found.filter(Boolean).forEach(d => cands.push({ d, score, idx }));
+  });
+  if (!cands.length) return "";
+  cands.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  return cands[0].d;
+}
+
+function findAmount(text){
+  const lines = text.split("\n");
+  const num = /\$?\s?(\d{1,3}(?:[,\s]\d{3})+|\d+)[.,](\d{2})(?!\d)/g;
+  const nums = s => { const out = []; let m; num.lastIndex = 0; while ((m = num.exec(s))) out.push(parseFloat(m[1].replace(/[,\s]/g, "") + "." + m[2])); return out; };
+  const rules = [
+    [/grand\s*total|total\s*(amount|incl|inc\b|including|aud|payable)|amount\s*payable/i, 6],
+    [/amount\s*due|balance\s*due|total\s*due/i, 5],
+    [/\btotal\b/i, 4],
+    [/amount\s*paid|total\s*paid|paid/i, 3],
+    [/eftpos|visa|mastercard|amex|card|purchase/i, 2]
+  ];
+  const exclude = /sub\s*-?\s*total|total\s*gst|gst\s*total|total\s*tax|discount|saving|change|rounding|tip|items?\s*total|qty/i;
+  let best = null;
+  lines.forEach((ln, i) => {
+    if (exclude.test(ln)) return;
+    const rule = rules.find(r => r[0].test(ln));
+    if (!rule) return;
+    let vals = nums(ln);
+    if (!vals.length && lines[i+1]) vals = nums(lines[i+1]);
+    if (!vals.length) return;
+    const v = Math.max(...vals);
+    if (!best || rule[1] > best.score || (rule[1] === best.score && v > best.v)) best = { v, score: rule[1] };
+  });
+  if (!best){ // fallback: largest $ amount on the document
+    const all = [];
+    let m; const r = /\$\s?(\d{1,3}(?:,\d{3})+|\d+)\.(\d{2})/g;
+    while ((m = r.exec(text))) all.push(parseFloat(m[1].replace(/,/g, "") + "." + m[2]));
+    if (all.length) best = { v: Math.max(...all) };
+  }
+  return best ? best.v.toFixed(2) : "";
+}
+
+const BRANDS = ["Woolworths","Coles","Aldi","IGA","Qantas","Jetstar","Virgin Australia","Rex","Uber","DiDi","Ola","13cabs","Bunnings","Officeworks","Kmart","Target","JB Hi-Fi","Harvey Norman","BP","Shell","Ampol","Caltex","7-Eleven","Mobil","United Petroleum","Marriott","Hilton","Hyatt","Novotel","Ibis","Mercure","Pullman","Sofitel","Crowne Plaza","Holiday Inn","Rydges","Quest","Accor","Airbnb","Booking.com","Hertz","Avis","Budget","Europcar","Thrifty","Telstra","Optus","Vodafone","McDonald's","Hungry Jack's","Subway","Starbucks","Grill'd","Guzman y Gomez","Domino's","Chemist Warehouse","Priceline","Dan Murphy's","BWS","Myki","Linkt","CityLink","EastLink","Microsoft","Apple","Amazon","Google","Officeworks"];
+
+function cleanCompany(s){
+  s = s.replace(/\b(pty\.?\s*ltd\.?|pty\.?\s*limited|proprietary\s*limited|limited|ltd\.?|inc\.?|australia\s*pty)\b/gi, "")
+       .replace(/\b(abn|acn)\b.*$/i, "")
+       .replace(/[\\\/:*?"<>|#%{}~&]/g, "")
+       .replace(/[^\p{L}\p{N}\s'.\-]/gu, "")
+       .replace(/\s+/g, " ").trim().replace(/[.\-\s]+$/, "");
+  if (s && s === s.toUpperCase() && s.length > 4)
+    s = s.toLowerCase().replace(/\b\p{L}/gu, c => c.toUpperCase());
+  return s.slice(0, 40).trim();
+}
+
+function findCompany(text){
+  let best = null;
+  for (const b of BRANDS){
+    const re = new RegExp("(^|[^a-z])" + b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^a-z]|$)", "i");
+    const m = re.exec(text);
+    if (m && (!best || m.index < best.i)) best = { b, i: m.index };
+  }
+  if (best && best.i < 600) return best.b;
+  const skip = /(tax\s*invoice|invoice|receipt|welcome|thank|abn|acn|phone|ph[:\s]|tel|fax|www\.|http|@|date|page|order|customer|bill\s*to|ship|copy|duplicate|eftpos|terminal|merchant\s*id|^\s*total)/i;
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean).slice(0, 8);
+  for (const l of lines){
+    const letters = (l.match(/\p{L}/gu) || []).length;
+    if (l.length < 3 || letters < 3 || letters / l.length < 0.5 || skip.test(l)) continue;
+    const c = cleanCompany(l);
+    if (c.length >= 2) return c;
+  }
+  if (best) return best.b;
+  return "";
+}
+
+/* ---------- UI ---------- */
+function extOf(file){
+  const m = /\.([a-z0-9]+)$/i.exec(file.name || "");
+  if (m) return m[1].toLowerCase().replace("jpeg", "jpg");
+  if (file.type === "application/pdf") return "pdf";
+  if (file.type === "image/png") return "png";
+  if (file.type === "image/heic") return "heic";
+  return "jpg";
+}
+function buildName(it){
+  const d = it.el.querySelector(".d").value;
+  const c = cleanCompany(it.el.querySelector(".c").value) || "Unknown";
+  let a = it.el.querySelector(".a").value.replace(/[^0-9.]/g, "");
+  if (a && !isNaN(parseFloat(a))) a = parseFloat(a).toFixed(2);
+  return `${d || "0000-00-00"} ${c} ${a || "0.00"}.${it.ext}`;
+}
+function refresh(it){
+  ["d","c","a"].forEach(k => { const f = it.el.querySelector("." + k); f.classList.toggle("missing", !f.value.trim()); });
+  it.el.querySelector(".name").textContent = buildName(it);
+}
+function setStatus(it, msg, cls){ const s = it.el.querySelector(".status"); s.textContent = msg; s.className = "status " + (cls || ""); }
+function setProgress(it, p){ it.el.querySelector(".bar>div").style.width = Math.round(p * 100) + "%"; }
+
+function addCard(file){
+  if ($(".empty")) $(".empty").remove();
+  const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
+  const it = { file, ext: extOf(file), isPdf, saved: false };
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML = `
+    <div class="head">
+      ${isPdf ? '<div class="thumb">PDF</div>' : '<img class="thumb" alt="">'}
+      <div style="flex:1;min-width:0">
+        <div class="status">Waiting…</div>
+        <div class="orig"></div>
+        <div class="bar"><div></div></div>
+      </div>
+    </div>
+    <div class="row">
+      <div><label>Invoice date</label><input class="f d" type="date"></div>
+      <div><label>Total amount</label><input class="f a" inputmode="decimal" placeholder="0.00"></div>
+    </div>
+    <label>Company</label><input class="f c" placeholder="Company name" autocapitalize="words">
+    <div class="name"></div>
+    <div class="cardbtns">
+      <button class="btn ok save">💾 Save</button>
+      <button class="btn secondary remove">Remove</button>
+    </div>
+    <details><summary>Show text read from document</summary><pre class="raw"></pre></details>`;
+  el.querySelector(".orig").textContent = file.name || "Photo";
+  if (!isPdf){ const u = URL.createObjectURL(file); el.querySelector("img.thumb").src = u; }
+  it.el = el;
+  el.querySelectorAll("input").forEach(i => i.addEventListener("input", () => refresh(it)));
+  el.querySelector(".save").onclick = () => saveFiles([it]);
+  el.querySelector(".remove").onclick = () => { items.splice(items.indexOf(it), 1); el.remove(); updateSaveAll(); };
+  $("#list").prepend(el);
+  items.push(it);
+  refresh(it);
+  updateSaveAll();
+  return it;
+}
+
+let queue = Promise.resolve();
+function handleFiles(list){
+  for (const f of list){
+    const ok = /pdf|image\//.test(f.type) || /\.(pdf|jpe?g|png|heic|heif)$/i.test(f.name || "");
+    const it = addCard(f);
+    if (!ok){ setStatus(it, "Unsupported file type. Use PDF, JPG, PNG or HEIC.", "err"); continue; }
+    queue = queue.then(() => process(it));
+  }
+}
+
+async function process(it){
+  try {
+    setStatus(it, it.isPdf ? "Reading PDF…" : "Reading receipt…", "");
+    setProgress(it, 0.05);
+    let text;
+    if (it.isPdf) text = await readPdf(it);
+    else text = await ocr(it, toCanvas(await loadImage(it.file)));
+    setProgress(it, 1);
+    it.el.querySelector(".raw").textContent = text || "(no text found)";
+    if (!text.replace(/\s/g, "")){
+      setStatus(it, "No text found. Retake the photo in better light, or type the details.", "err");
+      refresh(it); return;
+    }
+    const d = findDate(text), c = findCompany(text), a = findAmount(text);
+    it.el.querySelector(".d").value = d;
+    it.el.querySelector(".c").value = c;
+    it.el.querySelector(".a").value = a;
+    refresh(it);
+    const missing = [!d && "date", !c && "company", !a && "amount"].filter(Boolean);
+    if (missing.length) setStatus(it, "Please add: " + missing.join(", "), "warn");
+    else setStatus(it, "Check the details, then Save", "ok");
+  } catch (e){
+    ocrItem = null;
+    setStatus(it, (e && e.message) || "Something went wrong. Type the details manually.", "err");
+    refresh(it);
+  }
+}
+
+async function saveFiles(list){
+  const files = list.map(it => new File([it.file], buildName(it), { type: it.file.type || (it.isPdf ? "application/pdf" : "image/jpeg") }));
+  try {
+    if (navigator.canShare && navigator.canShare({ files })){
+      await navigator.share({ files }); // iPhone: choose "Save to Files"
+    } else {
+      for (const f of files){
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(f); a.download = f.name;
+        document.body.appendChild(a); a.click(); a.remove();
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+    list.forEach(it => { it.saved = true; setStatus(it, "Saved as " + buildName(it), "ok"); });
+  } catch (e){
+    if (e && e.name === "AbortError") return; // user closed the share sheet
+    list.forEach(it => setStatus(it, "Save failed: " + ((e && e.message) || "unknown error") + ". Try again.", "err"));
+  }
+}
+
+function updateSaveAll(){
+  const b = $("#saveAll");
+  b.style.display = items.length > 1 ? "flex" : "none";
+  b.textContent = `💾 Save All (${items.length})`;
+}
+$("#saveAll").onclick = () => saveFiles(items.slice());
+$("#cam").onchange = e => { handleFiles(e.target.files); e.target.value = ""; };
+$("#pick").onchange = e => { handleFiles(e.target.files); e.target.value = ""; };
+</script>
+</body>
+</html>
